@@ -26,6 +26,45 @@ Optional checks:
 
 You can search or filter the table (click a summary chip to filter by type) and export a discrepancy report to Excel. **Dark mode** is a shop-floor theme. **Ctrl+Enter** compares; **Ctrl+E** exports.
 
+## Python vs JavaScript
+
+There is a matching browser app: [BomCompare_Javascript](https://github.com/sran4/BomCompare_Javascript). Both use the same comparison rules (missing, MPN mismatch, duplicates, DNP). Pick one:
+
+| | Python (this repo) | JavaScript |
+| --- | --- | --- |
+| **Best when** | Daily use on a line PC you control | Sharing a file or a quick look with no install |
+| **How you run it** | `python bom_smt_comparator.py` after a one-time venv | Double-click `BOM_SMT_Comparator.html` in Chrome or Edge |
+| **Install** | Python 3.12 + `pip install -r requirements.txt` | None |
+| **Sample on start** | No — you choose files | Yes — built-in demo with a “Sample data” banner |
+| **PDF / Excel** | pdfplumber (and pypdf fallback), pandas/openpyxl | PDF.js, SheetJS, ExcelJS in the page |
+| **Settings** | Remembered in Windows (window size, prefixes, dark mode) | Remembered in the browser (localStorage) |
+
+**Python — pros**
+
+- Stays up as a normal Windows window (drop files, shortcuts, export).
+- Header auto-detect and PDF text extract were solid on the shared test BOMs.
+- No wait for large in-page spreadsheet libraries.
+
+**Python — cons**
+
+- Must install Python and packages on each PC.
+- No demo comparison until you pick files.
+- Not something you email as a single double-click file.
+
+**JavaScript — pros**
+
+- Zero install; one HTML file or the `web/` folder.
+- Opens with a sample so new users see chips, filters, and a real table immediately.
+- Easy to put on a share or GitHub for anyone with a browser.
+
+**JavaScript — cons**
+
+- The single-file HTML is very large (libraries are inlined).
+- Relies on the browser; a blocked or slow script load can delay the first compare.
+- Weaker fit as the always-on tool on an SMT station.
+
+Use **this Python app** on the machine that compares production BOMs. Use **JavaScript** when someone only needs to try the tool or cannot install Python.
+
 ## What you need
 
 - Windows (tested with Python 3.12)
