@@ -1,0 +1,12 @@
+venv/
+.venv/
+__pycache__/
+*.py[cod]
+*.pyo
+.Python
+*.egg-info/
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db
+_capture_screens.py
