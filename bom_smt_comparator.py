@@ -50,7 +50,7 @@ from PySide6.QtCore import (
     Signal,
     Slot,
 )
-from PySide6.QtGui import QColor, QFont, QKeySequence, QPalette
+from PySide6.QtGui import QColor, QFont, QKeySequence, QPalette, QShortcut
 from PySide6.QtWidgets import (
     QAbstractItemView,
     QApplication,
@@ -93,7 +93,7 @@ except ImportError:  # pragma: no cover
 # =============================================================================
 APP_NAME = "BOM ⇄ SMT Setup Comparator"
 APP_ORG = "SMTTools"
-APP_VERSION = "1.0.0"
+APP_VERSION = "1.1.0"
 
 SMT_EXTENSIONS = (".txt", ".log", ".pdf")
 BOM_EXTENSIONS = (".xlsx", ".xls", ".xlsm")
@@ -132,6 +132,13 @@ TYPE_COLORS = {
     MPN_MISMATCH: "#FFF2CC",  # light yellow
     DUP_BOM: "#FCE4D6",       # light orange
     DUP_SMT: "#FCE4D6",
+}
+DARK_TYPE_COLORS = {
+    MISSING_SMT: "#6E3038",
+    MISSING_BOM: "#5C3338",
+    MPN_MISMATCH: "#6B5520",
+    DUP_BOM: "#6B4530",
+    DUP_SMT: "#6B4530",
 }
 
 COL_REF = "Reference Designator"
@@ -219,6 +226,9 @@ class CompareOptions:
     learn_prefixes: bool = True
     check_mpn: bool = True
     exclude_dnp: bool = True
+    smt_column_mode: bool = False
+    smt_ref_col: int = 6
+    smt_mpn_col: int = 3
 
 
 @dataclass
@@ -743,6 +753,45 @@ def parse_smt(lines: list, scanner: SmtScanner, bom_mpn_norms: set) -> dict:
     return dict(data)
 
 
+def parse_smt_columns(lines: list, scanner: SmtScanner, bom_mpn_norms: set,
+                      ref_col: int, mpn_col: int) -> dict:
+    """Parse a machine dump split on tabs, 2+ spaces, or pipes, using 1-based columns."""
+    if ref_col < 1:
+        raise AppError("Setup RefDes column must be 1 or greater.", "Configuration Error")
+    data = defaultdict(list)
+    last_mpn, last_ctx, last_idx = None, "", -999
+    for idx, (loc, raw_line) in enumerate(lines):
+        raw = raw_line.strip()
+        if not raw:
+            continue
+        parts = re.split(r"\t+|\s{2,}|\|", raw)
+        if ref_col > len(parts):
+            continue
+        refs = scanner.find(parts[ref_col - 1].upper())
+        if not refs:
+            continue
+        mpn = ""
+        if 1 <= mpn_col <= len(parts):
+            cand = parts[mpn_col - 1].strip()
+            if cand and not scanner.find(cand.upper()):
+                mpn = cand
+        if not mpn:
+            tokens = [t.strip("\"'()[]{}:") for t in SMT_TOKEN_SPLIT_RE.split(raw.upper()) if t]
+            tokens = [t for t in tokens if t]
+            mpn = scanner.guess_mpn(tokens, bom_mpn_norms) or ""
+        inherited = False
+        ctx = raw
+        if mpn:
+            last_mpn, last_ctx, last_idx = mpn, ctx, idx
+        elif last_mpn and idx - last_idx <= 3:
+            mpn, inherited = last_mpn, True
+            ctx = f"{last_ctx}  ⏎  {ctx}"
+            last_idx = idx
+        for r in unique(refs):
+            data[r].append(SmtEntry(r, mpn or "", loc, ctx, inherited))
+    return dict(data)
+
+
 # =============================================================================
 # Comparison
 # =============================================================================
@@ -842,12 +891,21 @@ def run_comparison(opts: CompareOptions, report: Callable[[int, str], None]) -> 
     scanner = SmtScanner(prefixes)
     bom_mpn_norms = {n for es in bom.entries.values() for e in es
                      for n in [normalize_mpn(e.mpn)] if len(n) >= 4}
-    smt = parse_smt(lines, scanner, bom_mpn_norms)
+    if opts.smt_column_mode:
+        report(62, f"Reading setup columns {opts.smt_ref_col} (designators) / {opts.smt_mpn_col} (MPN)…")
+        smt = parse_smt_columns(lines, scanner, bom_mpn_norms, opts.smt_ref_col, opts.smt_mpn_col)
+    else:
+        smt = parse_smt(lines, scanner, bom_mpn_norms)
     if not smt:
+        extra = ""
+        if opts.smt_column_mode:
+            extra = (f"\n\nColumn mode is on (designators in column {opts.smt_ref_col}, "
+                     f"MPN in column {opts.smt_mpn_col}). Turn it off for free-form sheets, "
+                     "or change the column numbers.")
         raise ParseError(
             "No reference designators were found in the SMT setup sheet.\n\n"
             "Check that the correct file was selected and that the designator prefixes "
-            "(e.g. R, C, U) match the ones used on the sheet."
+            "(e.g. R, C, U) match the ones used on the sheet." + extra
         )
 
     report(85, "Comparing…")
@@ -963,6 +1021,14 @@ class DiscrepancyModel(QAbstractTableModel):
     def __init__(self, parent=None):
         super().__init__(parent)
         self._rows: list = []
+        self._dark = False
+
+    def set_dark(self, dark: bool):
+        self._dark = bool(dark)
+        if self._rows:
+            top = self.index(0, 0)
+            bot = self.index(self.rowCount() - 1, self.columnCount() - 1)
+            self.dataChanged.emit(top, bot, [Qt.ItemDataRole.BackgroundRole, Qt.ItemDataRole.ForegroundRole])
 
     def set_rows(self, rows: list):
         self.beginResetModel()
@@ -994,10 +1060,16 @@ class DiscrepancyModel(QAbstractTableModel):
                 tip += f"\nSMT source: {row[COL_SMT_SRC]}"
             return tip
         if role == Qt.ItemDataRole.BackgroundRole:
-            color = TYPE_COLORS.get(row.get(COL_TYPE))
-            return QColor(color) if color else None
+            palette = DARK_TYPE_COLORS if self._dark else TYPE_COLORS
+            color = palette.get(row.get(COL_TYPE))
+            if not color:
+                return None
+            qc = QColor(color)
+            if index.row() % 2:
+                qc = qc.darker(108)
+            return qc
         if role == Qt.ItemDataRole.ForegroundRole:
-            return QColor("#1F2933")
+            return QColor("#E8EEF4") if self._dark else QColor("#1F2933")
         if role == Qt.ItemDataRole.FontRole and col == COL_TYPE:
             f = QFont()
             f.setBold(True)
@@ -1102,8 +1174,15 @@ class MainWindow(QMainWindow):
         self._worker: Optional[CompareWorker] = None
         self._result: Optional[CompareResult] = None
         self._loading_headers = False
+        self._dark = False
         self._build_ui()
         self._restore_settings()
+        self._apply_theme(self._dark)
+        for key in ("Ctrl+Return", "Ctrl+Enter"):
+            shortcut = QShortcut(QKeySequence(key), self)
+            shortcut.activated.connect(self._start_compare)
+        export_shortcut = QShortcut(QKeySequence("Ctrl+E"), self)
+        export_shortcut.activated.connect(self._export)
 
     # ------------------------------------------------------------------ UI build
     def _build_ui(self):
@@ -1122,12 +1201,20 @@ class MainWindow(QMainWindow):
         layout.setContentsMargins(14, 14, 8, 14)
         layout.setSpacing(12)
 
+        title_row = QHBoxLayout()
         title = QLabel("BOM ⇄ SMT Setup Comparator")
         title.setObjectName("title")
+        title_row.addWidget(title, 1)
+        self.theme_btn = QPushButton("Dark mode")
+        self.theme_btn.setObjectName("theme")
+        self.theme_btn.setCheckable(True)
+        self.theme_btn.setToolTip("Toggle a darker shop-floor theme. Saved for next launch.")
+        self.theme_btn.toggled.connect(self._on_theme_toggled)
+        title_row.addWidget(self.theme_btn)
+        layout.addLayout(title_row)
         subtitle = QLabel("Verify that what is loaded on the line matches the engineering BOM.")
         subtitle.setObjectName("subtitle")
         subtitle.setWordWrap(True)
-        layout.addWidget(title)
         layout.addWidget(subtitle)
 
         # --- Files
@@ -1135,6 +1222,7 @@ class MainWindow(QMainWindow):
         fl = QVBoxLayout(files_box)
         fl.addWidget(QLabel("SMT Setup Sheet (.txt, .log, .pdf)"))
         self.smt_edit = FileLineEdit(SMT_EXTENSIONS, "Browse or drop a setup sheet…")
+        self.smt_edit.fileDropped.connect(self._on_smt_selected)
         smt_btn = QPushButton("Browse…")
         smt_btn.clicked.connect(self._browse_smt)
         row = QHBoxLayout()
@@ -1198,14 +1286,37 @@ class MainWindow(QMainWindow):
         ol.addRow(self.learn_chk)
         ol.addRow(self.mpn_chk)
         ol.addRow(self.dnp_chk)
+        self.col_mode_chk = QCheckBox("Setup sheet is columnar (tab / 2+ spaces / |)")
+        self.col_mode_chk.setToolTip(
+            "Use this only for machine dumps with a fixed column for designators. "
+            "Leave off for typical feeder sheets."
+        )
+        self.col_mode_chk.toggled.connect(self._sync_column_mode)
+        self.smt_ref_spin = QSpinBox()
+        self.smt_ref_spin.setRange(1, 40)
+        self.smt_ref_spin.setValue(6)
+        self.smt_ref_spin.setToolTip("1-based column that holds reference designators.")
+        self.smt_mpn_spin = QSpinBox()
+        self.smt_mpn_spin.setRange(0, 40)
+        self.smt_mpn_spin.setValue(3)
+        self.smt_mpn_spin.setSpecialValueText("Guess")
+        self.smt_mpn_spin.setToolTip("1-based MPN column. 0 = guess from the rest of the line.")
+        ol.addRow(self.col_mode_chk)
+        ol.addRow("Setup RefDes column:", self.smt_ref_spin)
+        ol.addRow("Setup MPN column:", self.smt_mpn_spin)
         layout.addWidget(opt_box)
 
         # --- Action
         self.compare_btn = QPushButton("Compare Files")
         self.compare_btn.setObjectName("primary")
         self.compare_btn.setMinimumHeight(46)
+        self.compare_btn.setToolTip("Ctrl+Enter")
         self.compare_btn.clicked.connect(self._start_compare)
         layout.addWidget(self.compare_btn)
+        hint = QLabel("PDF must be selectable text, not a scan. Header Auto-detect is usually enough. Ctrl+Enter compares · Ctrl+E exports.")
+        hint.setObjectName("subtitle")
+        hint.setWordWrap(True)
+        layout.addWidget(hint)
 
         self.progress = QProgressBar()
         self.progress.setRange(0, 100)
@@ -1247,8 +1358,11 @@ class MainWindow(QMainWindow):
         self.summary_label = QLabel("No comparison run yet.")
         self.summary_label.setObjectName("summary")
         self.summary_label.setWordWrap(True)
-        self.summary_label.setTextFormat(Qt.TextFormat.RichText)
         layout.addWidget(self.summary_label)
+
+        self.chip_bar = QHBoxLayout()
+        self.chip_bar.setSpacing(6)
+        layout.addLayout(self.chip_bar)
 
         bar = QHBoxLayout()
         self.search_edit = QLineEdit()
@@ -1258,6 +1372,7 @@ class MainWindow(QMainWindow):
         self.type_combo.addItems([DiscrepancyFilter.ALL] + ALL_TYPES)
         self.export_btn = QPushButton("Export to Excel")
         self.export_btn.setObjectName("secondary")
+        self.export_btn.setToolTip("Ctrl+E")
         self.export_btn.setEnabled(False)
         self.export_btn.clicked.connect(self._export)
         bar.addWidget(self.search_edit, 1)
@@ -1280,6 +1395,7 @@ class MainWindow(QMainWindow):
         self.table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
         self.table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
         self.table.setWordWrap(False)
+        self.table.setAlternatingRowColors(True)
         self.table.verticalHeader().setVisible(False)
         self.table.verticalHeader().setDefaultSectionSize(26)
         hh = self.table.horizontalHeader()
@@ -1291,8 +1407,13 @@ class MainWindow(QMainWindow):
 
         legend = QHBoxLayout()
         for label, typ in (("Missing", MISSING_SMT), ("Mismatch", MPN_MISMATCH), ("Duplicate", DUP_BOM)):
-            chip = QLabel(f"  {label}  ")
-            chip.setStyleSheet(f"background:{TYPE_COLORS[typ]}; color:#1F2933; border-radius:4px; padding:2px;")
+            chip = QPushButton(label)
+            chip.setCursor(Qt.CursorShape.PointingHandCursor)
+            chip.setStyleSheet(
+                f"QPushButton {{ background:{TYPE_COLORS[typ]}; color:#1F2933; border:none; "
+                f"border-radius:4px; padding:3px 8px; }}"
+            )
+            chip.clicked.connect(lambda _, t=typ: self._filter_type(t))
             legend.addWidget(chip)
         legend.addStretch(1)
         self.count_label = QLabel("")
@@ -1312,6 +1433,14 @@ class MainWindow(QMainWindow):
         self.learn_chk.setChecked(s.value("learn", True, type=bool))
         self.mpn_chk.setChecked(s.value("check_mpn", True, type=bool))
         self.dnp_chk.setChecked(s.value("exclude_dnp", True, type=bool))
+        self.col_mode_chk.setChecked(s.value("smt_column_mode", False, type=bool))
+        self.smt_ref_spin.setValue(int(s.value("smt_ref_col", 6)))
+        self.smt_mpn_spin.setValue(int(s.value("smt_mpn_col", 3)))
+        self._dark = s.value("dark", False, type=bool)
+        self.theme_btn.blockSignals(True)
+        self.theme_btn.setChecked(self._dark)
+        self.theme_btn.blockSignals(False)
+        self._sync_column_mode(self.col_mode_chk.isChecked())
 
     def _save_settings(self):
         s = self.settings
@@ -1321,6 +1450,10 @@ class MainWindow(QMainWindow):
         s.setValue("learn", self.learn_chk.isChecked())
         s.setValue("check_mpn", self.mpn_chk.isChecked())
         s.setValue("exclude_dnp", self.dnp_chk.isChecked())
+        s.setValue("smt_column_mode", self.col_mode_chk.isChecked())
+        s.setValue("smt_ref_col", self.smt_ref_spin.value())
+        s.setValue("smt_mpn_col", self.smt_mpn_spin.value())
+        s.setValue("dark", self._dark)
 
     def _last_dir(self) -> str:
         return self.settings.value("last_dir", os.path.expanduser("~"))
@@ -1336,6 +1469,18 @@ class MainWindow(QMainWindow):
         if path:
             self._remember_dir(path)
             self.smt_edit.setText(path)
+            self._on_smt_selected(path)
+
+    def _on_smt_selected(self, path: str):
+        if not path or not os.path.isfile(path):
+            return
+        try:
+            lines = read_smt_lines(path)
+        except AppError as e:
+            self.statusBar().showMessage(str(e).split("\n", 1)[0])
+            return
+        n = sum(1 for _, text in lines if text.strip())
+        self.statusBar().showMessage(f"Setup sheet loaded: {n} text line(s).")
 
     def _browse_bom(self):
         path, _ = QFileDialog.getOpenFileName(
@@ -1449,6 +1594,9 @@ class MainWindow(QMainWindow):
             learn_prefixes=self.learn_chk.isChecked(),
             check_mpn=self.mpn_chk.isChecked(),
             exclude_dnp=self.dnp_chk.isChecked(),
+            smt_column_mode=self.col_mode_chk.isChecked(),
+            smt_ref_col=self.smt_ref_spin.value(),
+            smt_mpn_col=self.smt_mpn_spin.value(),
         )
 
     def _start_compare(self):
@@ -1474,8 +1622,11 @@ class MainWindow(QMainWindow):
 
     def _set_busy(self, busy: bool):
         for w in (self.compare_btn, self.smt_edit, self.bom_edit, self.sheet_combo, self.header_spin,
-                  self.ref_combo, self.mpn_combo, self.desc_combo, self.prefix_edit, self.ignore_edit):
+                  self.ref_combo, self.mpn_combo, self.desc_combo, self.prefix_edit, self.ignore_edit,
+                  self.col_mode_chk, self.smt_ref_spin, self.smt_mpn_spin, self.theme_btn):
             w.setEnabled(not busy)
+        if not busy:
+            self._sync_column_mode(self.col_mode_chk.isChecked())
         self.compare_btn.setText("Comparing…" if busy else "Compare Files")
         self.progress.setVisible(busy)
         if busy:
@@ -1498,6 +1649,7 @@ class MainWindow(QMainWindow):
         self.model.set_rows(result.rows)
         self.table.sortByColumn(0, Qt.SortOrder.AscendingOrder)
         self.export_btn.setEnabled(True)
+        self._refresh_type_filter(result)
         self._update_summary(result)
         self._update_count()
         st = result.stats
@@ -1513,9 +1665,6 @@ class MainWindow(QMainWindow):
                         "Click 'Show Details…' to review.")
             box.setDetailedText("\n\n".join(result.warnings))
             box.exec()
-        elif st["total"] == 0:
-            QMessageBox.information(self, "No Discrepancies",
-                                    "✔ The BOM and SMT setup sheet match. No discrepancies were found.")
 
     @Slot(str, str, str)
     def _on_failed(self, title: str, message: str, details: str):
@@ -1534,17 +1683,98 @@ class MainWindow(QMainWindow):
 
     def _update_summary(self, result: CompareResult):
         st = result.stats
-        chips = " ".join(
-            f"<span style='background:{TYPE_COLORS[t]}; color:#1F2933;'>&nbsp;{t}: <b>{st[t]}</b>&nbsp;</span>"
-            for t in ALL_TYPES if st.get(t)
-        ) or "<span style='color:#1E7D32;'><b>✔ No discrepancies</b></span>"
-        self.summary_label.setText(
-            f"<b>BOM:</b> {st['bom_refs']} designators &nbsp;·&nbsp; "
-            f"<b>SMT:</b> {st['smt_refs']} &nbsp;·&nbsp; <b>In both:</b> {st['common']} &nbsp;·&nbsp; "
-            f"<b>MPN verified:</b> {st['mpn_verified']} &nbsp;·&nbsp; "
-            f"<b>Unverifiable:</b> {st['mpn_unverified']} &nbsp;·&nbsp; "
-            f"<b>DNP excluded:</b> {st['dnp_excluded']}<br>{chips}"
-        )
+        if st["total"] == 0:
+            self.summary_label.setText(
+                f"BOM: {st['bom_refs']} designators  ·  SMT: {st['smt_refs']}  ·  "
+                f"In both: {st['common']}  ·  MPN verified: {st['mpn_verified']}  ·  "
+                f"DNP excluded: {st['dnp_excluded']}\n"
+                "✔ The BOM and SMT setup sheet match. No discrepancies were found."
+            )
+        else:
+            self.summary_label.setText(
+                f"BOM: {st['bom_refs']} designators  ·  SMT: {st['smt_refs']}  ·  "
+                f"In both: {st['common']}  ·  MPN verified: {st['mpn_verified']}  ·  "
+                f"Unverifiable: {st['mpn_unverified']}  ·  DNP excluded: {st['dnp_excluded']}"
+            )
+        self._rebuild_chips(st)
+
+    def _clear_layout(self, layout: QHBoxLayout):
+        while layout.count():
+            item = layout.takeAt(0)
+            widget = item.widget()
+            if widget is not None:
+                widget.deleteLater()
+
+    def _chip_button(self, text: str, color: Optional[str], handler) -> QPushButton:
+        btn = QPushButton(text)
+        btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        if color:
+            btn.setStyleSheet(
+                f"QPushButton {{ background:{color}; color:#1F2933; border:none; "
+                f"border-radius:6px; padding:4px 10px; font-weight:600; }}"
+            )
+        btn.clicked.connect(handler)
+        return btn
+
+    def _rebuild_chips(self, st: dict):
+        self._clear_layout(self.chip_bar)
+        if not st.get("total"):
+            banner = QLabel("✔ No discrepancies")
+            banner.setObjectName("okBanner")
+            self.chip_bar.addWidget(banner)
+            self.chip_bar.addStretch(1)
+            return
+        self.chip_bar.addWidget(self._chip_button("All", None, lambda: self._filter_type(DiscrepancyFilter.ALL)))
+        for typ in ALL_TYPES:
+            count = st.get(typ) or 0
+            if not count:
+                continue
+            self.chip_bar.addWidget(
+                self._chip_button(f"{typ}: {count}", TYPE_COLORS[typ], lambda _, t=typ: self._filter_type(t))
+            )
+        self.chip_bar.addStretch(1)
+
+    def _filter_type(self, typ: str):
+        idx = self.type_combo.findText(typ)
+        if idx >= 0:
+            self.type_combo.setCurrentIndex(idx)
+
+    def _refresh_type_filter(self, result: CompareResult):
+        present = [t for t in ALL_TYPES if result.stats.get(t)]
+        current = self.type_combo.currentText()
+        self.type_combo.blockSignals(True)
+        self.type_combo.clear()
+        self.type_combo.addItem(DiscrepancyFilter.ALL)
+        self.type_combo.addItems(present)
+        if current in present or current == DiscrepancyFilter.ALL:
+            self.type_combo.setCurrentText(current)
+        else:
+            self.type_combo.setCurrentText(DiscrepancyFilter.ALL)
+        self.type_combo.blockSignals(False)
+        self.proxy.set_type(self.type_combo.currentText())
+
+    def _sync_column_mode(self, on: bool):
+        self.smt_ref_spin.setEnabled(on)
+        self.smt_mpn_spin.setEnabled(on)
+
+    def _on_theme_toggled(self, dark: bool):
+        self._dark = bool(dark)
+        self._apply_theme(self._dark)
+        self._save_settings()
+
+    def _apply_theme(self, dark: bool):
+        app = QApplication.instance()
+        if app is None:
+            return
+        self.theme_btn.setText("Light mode" if dark else "Dark mode")
+        if dark:
+            apply_dark_palette(app)
+            app.setStyleSheet(DARK_STYLE_SHEET)
+        else:
+            apply_light_palette(app)
+            app.setStyleSheet(STYLE_SHEET)
+        if hasattr(self, "model"):
+            self.model.set_dark(dark)
 
     def _update_count(self):
         total = self.model.rowCount()
@@ -1659,6 +1889,44 @@ QHeaderView::section { background: #102A43; color: white; padding: 6px; border: 
                        border-right: 1px solid #243B53; font-weight: 600; }
 QStatusBar { background: #E4E7EB; }
 QCheckBox { font-weight: 400; }
+QPushButton#theme { padding: 4px 10px; font-weight: 600; }
+QLabel#okBanner { color: #1E7D32; font-weight: 700; }
+"""
+
+
+DARK_STYLE_SHEET = """
+QWidget { font-size: 10pt; color: #E8EEF4; }
+QMainWindow, QScrollArea, QScrollArea > QWidget > QWidget { background: #1B2430; }
+QLabel#title { font-size: 16pt; font-weight: 700; color: #F0F7FC; }
+QLabel#section { font-size: 13pt; font-weight: 700; color: #F0F7FC; }
+QLabel#subtitle { color: #9FB3C8; }
+QLabel#summary { background: #243040; border: 1px solid #3D4F63; border-radius: 8px; padding: 8px; color: #E8EEF4; }
+QLabel#okBanner { color: #5FE08A; font-weight: 700; }
+QGroupBox { background: #243040; border: 1px solid #3D4F63; border-radius: 8px;
+            margin-top: 14px; padding: 12px 10px 10px 10px; font-weight: 600; color: #E8EEF4; }
+QGroupBox::title { subcontrol-origin: margin; left: 10px; padding: 0 4px; color: #B6C9DC; }
+QLineEdit, QComboBox, QSpinBox { background: #151C26; border: 1px solid #506078; border-radius: 5px;
+            padding: 5px 6px; min-height: 20px; font-weight: 400; color: #E8EEF4; }
+QLineEdit:focus, QComboBox:focus, QSpinBox:focus { border: 1px solid #2680C2; }
+QLineEdit:disabled, QComboBox:disabled, QSpinBox:disabled { background: #1B2430; color: #627D98; }
+QPushButton { background: #2F4258; color: white; border: 1px solid #506078; border-radius: 5px; padding: 6px 14px; }
+QPushButton:hover { background: #3A526C; }
+QPushButton#primary { background: #2680C2; color: white; border: none; font-size: 12pt; font-weight: 700; border-radius: 8px; }
+QPushButton#primary:hover { background: #186FAF; }
+QPushButton#primary:disabled { background: #3D4F63; }
+QPushButton#secondary { background: #1E7D32; color: white; border: none; font-weight: 600; }
+QPushButton#secondary:hover { background: #17692A; }
+QPushButton#secondary:disabled { background: #355244; }
+QPushButton#theme { padding: 4px 10px; font-weight: 600; }
+QProgressBar { border: 1px solid #506078; border-radius: 6px; background: #151C26; text-align: center; height: 18px; color: #E8EEF4; }
+QProgressBar::chunk { background: #2680C2; border-radius: 5px; }
+QTableView { background: #151C26; alternate-background-color: #1B2430; border: 1px solid #3D4F63; border-radius: 6px;
+             gridline-color: #3D4F63; color: #E8EEF4; selection-background-color: #2680C2; selection-color: white; }
+QHeaderView::section { background: #102A43; color: white; padding: 6px; border: none;
+                       border-right: 1px solid #243B53; font-weight: 600; }
+QStatusBar { background: #141C26; color: #9FB3C8; }
+QCheckBox { font-weight: 400; color: #E8EEF4; }
+QScrollArea { background: #1B2430; }
 """
 
 
@@ -1675,6 +1943,23 @@ def apply_light_palette(app: QApplication):
     pal.setColor(QPalette.ColorRole.HighlightedText, QColor("#FFFFFF"))
     pal.setColor(QPalette.ColorRole.ToolTipBase, QColor("#FFFFFF"))
     pal.setColor(QPalette.ColorRole.ToolTipText, QColor("#1F2933"))
+    app.setPalette(pal)
+
+
+def apply_dark_palette(app: QApplication):
+    pal = QPalette()
+    pal.setColor(QPalette.ColorRole.Window, QColor("#1B2430"))
+    pal.setColor(QPalette.ColorRole.WindowText, QColor("#E8EEF4"))
+    pal.setColor(QPalette.ColorRole.Base, QColor("#151C26"))
+    pal.setColor(QPalette.ColorRole.AlternateBase, QColor("#1B2430"))
+    pal.setColor(QPalette.ColorRole.Text, QColor("#E8EEF4"))
+    pal.setColor(QPalette.ColorRole.Button, QColor("#2F4258"))
+    pal.setColor(QPalette.ColorRole.ButtonText, QColor("#FFFFFF"))
+    pal.setColor(QPalette.ColorRole.Highlight, QColor("#2680C2"))
+    pal.setColor(QPalette.ColorRole.HighlightedText, QColor("#FFFFFF"))
+    pal.setColor(QPalette.ColorRole.ToolTipBase, QColor("#243040"))
+    pal.setColor(QPalette.ColorRole.ToolTipText, QColor("#E8EEF4"))
+    pal.setColor(QPalette.ColorRole.PlaceholderText, QColor("#9FB3C8"))
     app.setPalette(pal)
 
 

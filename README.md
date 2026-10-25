@@ -6,6 +6,8 @@ Desktop app that checks an SMT feeder setup sheet against an engineering BOM. It
 
 ![Discrepancy results](docs/app-results.png)
 
+![Dark mode](docs/app-dark.png)
+
 ## What it does
 
 The app reads reference designators from a BOM workbook and from an SMT setup sheet, then lists differences:
@@ -20,8 +22,9 @@ Optional checks:
 - Learn extra prefixes from the BOM
 - Verify manufacturer part numbers on the setup-sheet lines
 - Exclude BOM rows marked DNP / not fitted
+- Columnar setup sheet — only for machine dumps with a fixed designator column (tab / 2+ spaces / `|`)
 
-You can search or filter the table and export a discrepancy report to Excel.
+You can search or filter the table (click a summary chip to filter by type) and export a discrepancy report to Excel. **Dark mode** is a shop-floor theme. **Ctrl+Enter** compares; **Ctrl+E** exports.
 
 ## What you need
 
@@ -55,8 +58,8 @@ If the virtual environment already exists, skip the first two lines and run:
 2. Browse or drop the **BOM Excel** file. Sheet, header row, designator, MPN, and description columns are filled in automatically when possible.
 3. Header row **Auto-detect** is usually enough. Change **Sheet** or columns if your workbook uses unusual names.
 4. Adjust **SMT prefixes** if your designators are not the usual `R`, `C`, `U`, and so on.
-5. Click **Compare Files**.
-6. Filter or search the discrepancy table. Click **Export to Excel** to save a report.
+5. Click **Compare Files** (or press Ctrl+Enter).
+6. Filter or search the discrepancy table, or click a colored chip. Click **Export to Excel** (or press Ctrl+E) to save a report.
 
 ## Notes
 
