@@ -77,6 +77,8 @@ Supported inputs:
 
 ## How to run
 
+If you **downloaded a ZIP on Windows**, follow **[INSTALL_WINDOWS.md](INSTALL_WINDOWS.md)** or double-click **`Run.bat`**.
+
 From a terminal in this folder:
 
 ```powershell
